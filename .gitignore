@@ -1,5 +1,5 @@
-
 # pixi environments
 .pixi
 *.egg-info
 *.csv
+*.streamlit/
