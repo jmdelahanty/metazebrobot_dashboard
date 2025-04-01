@@ -5,4 +5,4 @@ numpy>=2.2.4,<3
 scipy>=1.15.2,<2
 google-cloud-storage>=2.0.0,<3.0.0
 google-auth>=2.0.0,<3.0.0
-lifelines=>0.30.0,<0.31
+lifelines>=0.30.0,<0.31
