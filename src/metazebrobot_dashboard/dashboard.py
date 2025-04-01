@@ -1,6 +1,7 @@
 import streamlit as st
 import polars as pl
 import numpy as np
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import Optional, Dict, Any, List
@@ -8,6 +9,14 @@ import os
 import traceback
 import re
 import pandas as pd # Keep for styling compatibility
+
+try:
+    import lifelines
+    import matplotlib.pyplot as plt # Lifelines plotting often uses Matplotlib
+    LIFELINES_AVAILABLE = True
+except ImportError:
+    LIFELINES_AVAILABLE = False
+    # Warning placed inside app logic
 
 # ---- NEW IMPORTS for GCS ----
 from google.cloud import storage
@@ -46,14 +55,6 @@ def hex_to_rgba(hex_color, alpha=0.3):
 
 
 # --- Plotting and Analysis Functions ---
-# (Keep all your existing plotting and analysis functions:
-# plot_survival_curves_pl, calculate_approx_median_survival, plot_cumulative_deaths_pl,
-# plot_distributions_pl, perform_housing_ttest, perform_density_anova,
-# plot_housing_comparison_pl, plot_density_vs_survival_pl, plot_remaining_by_group_pl,
-# plot_survival_rate_change_pl, plot_rate_change_by_density_pl,
-# calculate_critical_period_stats, display_stats_table)
-# ... (Your existing functions go here) ...
-# --- plot_survival_curves_pl (Handles Genotype/Housing, Density, and Cross ID grouping) ---
 def plot_survival_curves_pl(
     df: pl.DataFrame,
     color_by: str, # 'genotype_housing', 'density_category', or 'cross_id'
@@ -289,10 +290,10 @@ def plot_cumulative_deaths_pl(
     visible_conditions_list: Optional[List[str]] = None
 ) -> go.Figure:
     """
-    Plots the mean cumulative number of deaths over time, grouped by the specified column.
-    Includes shaded standard deviation bounds. Assumes group_by column is Utf8.
+    Plots the cumulative number of deaths for each individual dish over time,
+    grouped and colored by the specified column. Assumes group_by column is Utf8.
     """
-    print(f"Plotting cumulative deaths (group_by={group_by})...")
+    print(f"Plotting cumulative deaths per dish (group_by={group_by})...")
     plot_df = df.clone()
 
     group_col = group_by
@@ -302,23 +303,30 @@ def plot_cumulative_deaths_pl(
         st.error(f"Missing required columns for cumulative deaths plot: {missing}.")
         return go.Figure(layout=go.Layout(title="Cumulative Deaths Plot - Error: Columns Missing", height=600))
 
+    # --- Setup Titles and Colors ---
     title_map = {
-        'genotype_housing': 'Cumulative Deaths by Genotype and Housing (Mean +/- Std Dev)',
-        'density_category': 'Cumulative Deaths by Fish Density (Mean +/- Std Dev)',
-        'cross_id': 'Cumulative Deaths by Cross ID (Mean +/- Std Dev)'
+        'genotype_housing': 'Cumulative Deaths per Dish by Genotype and Housing',
+        'density_category': 'Cumulative Deaths per Dish by Fish Density',
+        'cross_id': 'Cumulative Deaths per Dish by Cross ID'
     }
     legend_title_map = {
         'genotype_housing': 'Genotype & Housing',
         'density_category': 'Fish Density',
         'cross_id': 'Cross ID'
     }
-    title = title_map.get(group_col, f'Cumulative Deaths by {group_col} (Mean +/- Std Dev)')
+    title = title_map.get(group_col, f'Cumulative Deaths per Dish by {group_col}')
     legend_title = legend_title_map.get(group_col, group_col)
-    COLOR_SEQUENCE = px.colors.qualitative.Plotly # Use a different sequence potentially
+    COLOR_SEQUENCE = px.colors.qualitative.Plotly # Or any other sequence
 
+    # --- Data Preparation ---
     # Ensure group column is Utf8 for consistent processing
     if plot_df[group_col].dtype != pl.Utf8:
-        plot_df = plot_df.with_columns(pl.col(group_col).cast(pl.Utf8))
+        try:
+            plot_df = plot_df.with_columns(pl.col(group_col).cast(pl.Utf8))
+            st.warning(f"Plotting function had to cast '{group_col}' back to Utf8. Check loading logic if this persists.")
+        except Exception as e:
+             st.error(f"Failed to cast column '{group_col}' to Utf8 for plotting: {e}")
+             return go.Figure(layout=go.Layout(title=title + f" - Error: Cannot Cast {group_col}", height=600))
 
     # Filter based on visible conditions (compare as strings)
     if visible_conditions_list is not None:
@@ -332,68 +340,191 @@ def plot_cumulative_deaths_pl(
                 st.warning(f"No data matches the selected filters for '{group_col}'.")
                 return go.Figure(layout=go.Layout(title=title, height=600, xaxis_title='Days Since Fertilization', yaxis_title='Cumulative Deaths'))
 
-    # Ensure numeric types for aggregation and drop nulls
-    plot_df_agg = plot_df.with_columns([
+    # Ensure numeric types for plotting and drop nulls required for lines
+    plot_df_clean = plot_df.with_columns([
         pl.col('days_since_fertilization').cast(pl.Int64, strict=False),
-        pl.col('cumulative_deaths').cast(pl.Float64, strict=False) # Use float for mean/std
-    ]).drop_nulls(subset=['days_since_fertilization', 'cumulative_deaths', group_col])
+        pl.col('cumulative_deaths').cast(pl.Float64, strict=False) # Keep as float in case of non-integer deaths recorded
+    ]).drop_nulls(subset=['dish_id', 'days_since_fertilization', 'cumulative_deaths', group_col])
 
-    if plot_df_agg.height == 0:
-        st.warning(f"No non-null data available for cumulative deaths plot ({group_col}).")
+    if plot_df_clean.height == 0:
+        st.warning(f"No non-null data available for cumulative deaths plot ({group_col}) after filtering.")
         return go.Figure(layout=go.Layout(title=title + " - No Data", height=600))
 
-    # Aggregate mean and std dev of cumulative deaths (group by Utf8)
-    agg_df = plot_df_agg.group_by([group_col, 'days_since_fertilization']).agg([
-        pl.mean('cumulative_deaths').alias('mean_cumulative_deaths'),
-        pl.std('cumulative_deaths').alias('std_cumulative_deaths')
-    ]).sort(group_col, 'days_since_fertilization')
+    # --- Get unique groups (from filtered data) and assign colors ---
+    unique_groups_agg = plot_df_clean.group_by(group_col).agg(pl.len()).sort(group_col)
+    unique_cats = unique_groups_agg[group_col].drop_nulls().to_list()
+    if not unique_cats:
+        st.warning(f"No valid groups found in column '{group_col}' after filtering and cleaning.")
+        return go.Figure(layout=go.Layout(title=title + " - No Groups Found", height=600))
+    color_map = {cat: COLOR_SEQUENCE[i % len(COLOR_SEQUENCE)] for i, cat in enumerate(unique_cats)}
 
-    # Calculate upper and lower bounds for shading
-    agg_df = agg_df.with_columns([
-        (pl.col('mean_cumulative_deaths') + pl.col('std_cumulative_deaths')).alias('upper_bound'),
-        (pl.col('mean_cumulative_deaths') - pl.col('std_cumulative_deaths')).clip(lower_bound=0).alias('lower_bound') # Ensure non-negative
-    ])
-
-    # Get unique groups (already Utf8) and assign colors
-    unique_groups = agg_df[group_col].drop_nulls().unique().sort().to_list()
-    color_map = {cat: COLOR_SEQUENCE[i % len(COLOR_SEQUENCE)] for i, cat in enumerate(unique_groups)}
-
-    # --- Create the plot using go.Scatter ---
+    # --- Create the plot ---
     fig = go.Figure()
 
-    for cat in unique_groups:
-        cat_data = agg_df.filter(pl.col(group_col) == cat)
-        if cat_data.height == 0: continue
+    # --- Add individual dish lines ---
+    # Get unique pairings of dish_id and its group from the cleaned data
+    unique_dishes_data = plot_df_clean.group_by(['dish_id', group_col]).agg(
+        pl.first('days_since_fertilization') # Just need one row per dish/group pair
+    ).drop_nulls()
 
-        color = color_map.get(cat)
-        if not color: continue
-        fill_color = hex_to_rgba(color, 0.2)
+    added_legend_groups = set() # Keep track of groups added to legend
 
-        x_vals = cat_data['days_since_fertilization']
-        y_upper = cat_data['upper_bound']
-        y_lower = cat_data['lower_bound']
-        y_mean = cat_data['mean_cumulative_deaths']
-        y_std = cat_data['std_cumulative_deaths']
+    for dish_info in unique_dishes_data.iter_rows(named=True):
+        dish_id = dish_info['dish_id']
+        group_name = dish_info[group_col] # This is Utf8
+        group_color = color_map.get(group_name)
 
-        # Add shaded area (Std Dev)
-        fig.add_trace(go.Scatter(x=x_vals, y=y_upper, mode='lines', line=dict(width=0), hoverinfo='skip', showlegend=False, name=f'{cat}_upper_death'))
-        fig.add_trace(go.Scatter(x=x_vals, y=y_lower, mode='lines', line=dict(width=0), fillcolor=fill_color, fill='tonexty', hoverinfo='skip', showlegend=False, name=f'{cat}_lower_death'))
+        if group_color: # Only plot if the group is valid and has a color
+            # Filter the cleaned data for the current dish
+            dish_data = plot_df_clean.filter(pl.col('dish_id') == dish_id).sort('days_since_fertilization')
 
-        # Add mean line
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=y_mean, mode='lines', line=dict(width=2, color=color), name=f'{cat} (mean)', legendgroup=str(cat),
-            hovertext=[f"Day: {d}<br>Avg Cum. Deaths: {m:.2f}<br>Std Dev: {'N/A' if s is None else f'{s:.2f}'}<br>Group: {cat}"
-                       for d, m, s in zip(x_vals, y_mean, y_std)],
-            hoverinfo="text"
-        ))
+            if dish_data.height > 0:
+                # Determine if this is the first trace for this group to show legend
+                show_legend_for_trace = False
+                if group_name not in added_legend_groups:
+                     show_legend_for_trace = True
+                     added_legend_groups.add(group_name)
+
+                fig.add_trace(go.Scatter(
+                    x=dish_data['days_since_fertilization'],
+                    y=dish_data['cumulative_deaths'],
+                    mode='lines',
+                    line=dict(width=1, color=group_color),
+                    opacity=0.7, # Make individual lines slightly transparent
+                    name=str(group_name) if show_legend_for_trace else f"_hidden_{dish_id}", # Show group name only once in legend
+                    legendgroup=str(group_name), # Group lines by condition
+                    showlegend=show_legend_for_trace, # Show legend only for the first trace of the group
+                    hovertext=[f"Dish: {dish_id}<br>Day: {d}<br>Cum. Deaths: {c:.1f}<br>Group: {group_name}"
+                               for d, c in zip(dish_data['days_since_fertilization'], dish_data['cumulative_deaths'])],
+                    hoverinfo="text"
+                ))
 
     # Update layout
     fig.update_layout(
-        title=title, xaxis_title='Days Since Fertilization', yaxis_title='Mean Cumulative Deaths',
-        legend_title_text=legend_title, legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
-        hovermode='x unified', height=600
+        title=title,
+        xaxis_title='Days Since Fertilization',
+        yaxis_title='Cumulative Deaths per Dish',
+        legend_title_text=legend_title,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+        hovermode='closest', # Use 'closest' for individual lines
+        height=600
     )
     fig.update_yaxes(rangemode='tozero') # Ensure y-axis starts at 0
+    return fig
+
+def plot_survival_faceted_by_density_housing(
+    df: pl.DataFrame,
+    facet_col: str = 'density_category', # Column to create subplots for ('density_category' or 'housing')
+    color_col: str = 'housing',        # Column to color lines by ('housing' or 'density_category')
+    visible_densities: Optional[List[str]] = None,
+    visible_housings: Optional[List[str]] = None
+) -> go.Figure:
+    """
+    Plots individual fish survival curves over time, faceted by one condition
+    (density or housing) and colored by the other.
+    """
+    print(f"Plotting faceted survival curves (facet: {facet_col}, color: {color_col})...")
+    plot_df = df.clone()
+
+    # --- Input Validation ---
+    valid_cols = ['density_category', 'housing']
+    if facet_col not in valid_cols or color_col not in valid_cols or facet_col == color_col:
+        st.error("Invalid facet_col or color_col specified. Choose different columns from 'density_category', 'housing'.")
+        return go.Figure(layout=go.Layout(title="Faceted Plot Error: Invalid Column Choice"))
+
+    required_cols = ['dish_id', 'days_since_fertilization', 'survival_rate', facet_col, color_col]
+    if not all(col in plot_df.columns for col in required_cols):
+        missing = [col for col in required_cols if col not in plot_df.columns]
+        st.error(f"Missing required columns for faceted survival plot: {missing}.")
+        return go.Figure(layout=go.Layout(title="Faceted Plot Error: Columns Missing", height=600))
+
+    # --- Data Preparation ---
+    # Ensure grouping/coloring columns are Utf8
+    cast_ops = []
+    for col in [facet_col, color_col]:
+         if plot_df[col].dtype != pl.Utf8:
+              cast_ops.append(pl.col(col).cast(pl.Utf8))
+    if cast_ops:
+        try:
+            plot_df = plot_df.with_columns(cast_ops)
+            st.warning(f"Faceted plot function had to cast columns to Utf8. Check loading logic if this persists.")
+        except Exception as e:
+             st.error(f"Failed to cast columns to Utf8 for faceted plotting: {e}")
+             return go.Figure(layout=go.Layout(title="Faceted Plot Error: Cannot Cast Columns", height=600))
+
+    # Filter based on visible selections
+    if visible_densities is not None and 'density_category' in plot_df.columns:
+        visible_densities_str = [str(d) for d in visible_densities]
+        plot_df = plot_df.filter(pl.col('density_category').is_in(visible_densities_str))
+
+    if visible_housings is not None and 'housing' in plot_df.columns:
+        visible_housings_str = [str(h) for h in visible_housings]
+        plot_df = plot_df.filter(pl.col('housing').is_in(visible_housings_str))
+
+    if plot_df.height == 0:
+        st.warning("No data matches the selected filters for the faceted plot.")
+        return go.Figure(layout=go.Layout(title="Faceted Survival Plot - No Matching Data", height=600))
+
+    # Ensure numeric types for plotting and drop nulls required for lines
+    plot_df_clean = plot_df.with_columns([
+        pl.col('days_since_fertilization').cast(pl.Int64, strict=False),
+        pl.col('survival_rate').cast(pl.Float64, strict=False)
+    ]).drop_nulls(subset=['dish_id', 'days_since_fertilization', 'survival_rate', facet_col, color_col])
+
+    if plot_df_clean.height == 0:
+        st.warning(f"No non-null data available for faceted plot after filtering.")
+        return go.Figure(layout=go.Layout(title="Faceted Survival Plot - No Data", height=600))
+
+    # --- Create Plot using Plotly Express ---
+    title = f"Individual Survival Curves by {color_col.replace('_', ' ').title()} (Faceted by {facet_col.replace('_', ' ').title()})"
+    labels = { # For better axis/legend titles
+        'days_since_fertilization': 'Days Since Fertilization',
+        'survival_rate': 'Survival Rate (%)',
+        'density_category': 'Density Category',
+        'housing': 'Housing Type'
+    }
+
+    try:
+        # Use line_group='dish_id' to draw a separate line for each dish
+        fig = px.line(
+            plot_df_clean.to_pandas(), # px works best with pandas for now
+            x='days_since_fertilization',
+            y='survival_rate',
+            color=color_col,      # Color lines by this column
+            facet_col=facet_col,  # Create subplot columns for this column
+            line_group='dish_id', # Crucial: draw line per dish
+            labels=labels,
+            title=title,
+            category_orders={ # Optional: control facet order if needed
+                 facet_col: sorted(plot_df_clean[facet_col].unique().to_list())
+            },
+            hover_data={ # Add extra info to hover tooltips
+                 'dish_id': True,
+                 facet_col: True,
+                 color_col: True,
+                 'days_since_fertilization': True,
+                 'survival_rate': ':.1f' # Format survival rate
+            }
+        )
+
+        # Customize layout
+        fig.update_traces(opacity=0.75, line=dict(width=1)) # Make individual lines clearer
+        fig.update_yaxes(range=[0, 100.5], title_text='Survival Rate (%)') # Ensure consistent Y axis
+        fig.update_xaxes(title_text='Days Since Fertilization')
+        # Adjust facet titles if needed (e.g., remove "density_category=")
+        fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+        fig.update_layout(
+            height=600, # Adjust height as needed
+            legend_title_text=labels.get(color_col, color_col.replace('_', ' ').title()),
+            hovermode='closest'
+        )
+        # fig.update_yaxes(matches=None) # Uncomment if you want independent Y-axes per facet
+
+    except Exception as e:
+        st.error(f"An error occurred while creating the faceted plot: {e}")
+        traceback.print_exc()
+        return go.Figure(layout=go.Layout(title="Faceted Plot Error: Plot Generation Failed", height=600))
+
     return fig
 
 
@@ -519,6 +650,266 @@ def plot_distributions_pl(
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
         height=600
     )
+
+    return fig
+
+@st.cache_data # Cache the prepared data
+def prepare_lifelines_data(df: pl.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Transforms the time-series data into a format suitable for Lifelines analysis.
+    Each row represents one dish.
+    'duration' is the last day observed for the dish.
+    'event_observed' is 1 if survival reached 0% by the last day, 0 otherwise (censored).
+    """
+    print("Preparing data for Lifelines...")
+    required_cols = ['dish_id', 'days_since_fertilization', 'survival_rate']
+    grouping_cols = ['genotype', 'housing', 'density_category', 'cross_id', 'genotype_housing'] # Add all potential grouping cols
+
+    if not all(c in df.columns for c in required_cols):
+        missing = [c for c in required_cols if c not in df.columns]
+        st.warning(f"Missing required columns for Lifelines data prep: {missing}. Cannot proceed.")
+        return None
+
+    # Find the last observation for each dish
+    last_observation = df.sort('dish_id', 'days_since_fertilization').group_by('dish_id').agg(
+        pl.last('days_since_fertilization').alias('duration'),
+        pl.last('survival_rate').alias('final_survival_rate'),
+        # Keep the first non-null value found for each grouping column for that dish
+        *[pl.first(col).alias(col) for col in grouping_cols if col in df.columns]
+    )
+
+    # Define the event: Did the dish reach 0% survival?
+    # Using a small threshold (<1%) to handle potential floating point inaccuracies
+    lifelines_ready_df = last_observation.with_columns(
+        pl.when(pl.col('final_survival_rate') < 1.0)
+        .then(1) # Event occurred (all died)
+        .otherwise(0) # Censored (some fish still alive at last check)
+        .alias('event_observed')
+    ).select(
+        ['dish_id', 'duration', 'event_observed'] + # Core columns
+        [col for col in grouping_cols if col in last_observation.columns] # Add existing grouping columns
+    ).drop_nulls(subset=['dish_id', 'duration', 'event_observed']) # Ensure core columns are not null
+
+    if lifelines_ready_df.height == 0:
+        st.warning("No valid dish data found after preparing for Lifelines analysis.")
+        return None
+
+    print(f"Lifelines data prepared with {lifelines_ready_df.height} dishes.")
+    # Lifelines often works more smoothly with Pandas DataFrames
+    return lifelines_ready_df.to_pandas()
+
+# --- Lifelines Plotting Function ---
+def plot_cumulative_hazard_individuals(
+    survival_df: pd.DataFrame, # Expects Pandas DataFrame from reconstruction
+    visible_housings: Optional[List[str]] = None,
+    visible_densities: Optional[List[str]] = None,
+    show_ci: bool = False, # Option to show/hide confidence intervals
+    ci_style: str = "shaded" # Options: "shaded", "lines", "both"
+) -> Optional[go.Figure]:
+    """
+    Plots the cumulative hazard based on reconstructed individual fish data
+    using Plotly for visualization with improved confidence interval display.
+
+    Args:
+        survival_df: Pandas DataFrame from reconstruct_individual_fish_data.
+        visible_housings: List of housing types to include.
+        visible_densities: List of density categories to include.
+        show_ci: Whether to calculate and display 95% confidence intervals.
+        ci_style: Style for confidence intervals ("shaded", "lines", or "both")
+
+    Returns:
+        A Plotly Figure object or None if plotting fails.
+    """
+    print("Plotting Lifelines Cumulative Hazard with Plotly (Individual Fish)...")
+
+    if not LIFELINES_AVAILABLE:
+        st.error("`lifelines` package not installed. Please install it (`pip install lifelines`) to use this feature.")
+        return None
+
+    required_cols = ['housing_type', 'density_category', 'time', 'event']
+    if not all(c in survival_df.columns for c in required_cols):
+        missing = [c for c in required_cols if c not in survival_df.columns]
+        st.error(f"Reconstructed data is missing columns: {missing}")
+        fig = go.Figure().add_annotation(text=f"Reconstructed data missing columns: {missing}", showarrow=False)
+        return fig
+
+    # Filter based on visible conditions BEFORE grouping
+    plot_df = survival_df.copy()
+    if visible_housings is not None:
+        plot_df = plot_df[plot_df['housing_type'].isin(visible_housings)]
+    if visible_densities is not None:
+        plot_df = plot_df[plot_df['density_category'].isin(visible_densities)]
+
+    if plot_df.empty:
+        st.warning("No reconstructed fish data matches the selected filters.")
+        fig = go.Figure().add_annotation(text="No data matches filters.", showarrow=False)
+        return fig
+
+    # --- Plotting with Plotly ---
+    fig = go.Figure()
+    naf = lifelines.NelsonAalenFitter()
+    colors = px.colors.qualitative.Plotly
+    groups = sorted(plot_df.groupby(['housing_type', 'density_category']))
+    color_idx = 0
+
+    for (housing, density), group_data in groups:
+        if group_data.empty: continue
+        label = f"{housing} - {density}"
+        color = colors[color_idx % len(colors)]
+        color_idx += 1
+
+        try:
+            naf.fit(
+                durations=group_data['time'],
+                event_observed=group_data['event'],
+                label=label,
+                alpha=0.05 # Corresponds to 95% CI
+            )
+
+            hazard_df_raw = naf.cumulative_hazard_
+            if hazard_df_raw.empty: 
+                st.warning(f"Cumulative hazard calculation returned empty for group '{label}'. Skipping.")
+                continue
+
+            estimate_col_name = hazard_df_raw.columns[0]
+            hazard_curve = hazard_df_raw.reset_index()
+            time_col_name = hazard_curve.columns[0]
+            if time_col_name != 'time': 
+                hazard_curve = hazard_curve.rename(columns={time_col_name: 'time'})
+            
+            # Add zero point if not present
+            if 0 not in hazard_curve['time'].values: 
+                hazard_curve = pd.concat([pd.DataFrame({'time': [0], estimate_col_name: [0.0]}), hazard_curve], 
+                                        ignore_index=True).sort_values('time')
+
+            # --- Extract and prepare confidence interval data ---
+            conf_int_plotted = False
+            if show_ci:
+                try:
+                    conf_int_raw = naf.confidence_interval_
+                    if not conf_int_raw.empty:
+                        # --- Dynamically find CI column names ---
+                        ci_cols = conf_int_raw.columns.tolist()
+                        lower_ci_col_name = next((col for col in ci_cols if 'lower' in col.lower()), None)
+                        upper_ci_col_name = next((col for col in ci_cols if 'upper' in col.lower()), None)
+
+                        if lower_ci_col_name and upper_ci_col_name:
+                            conf_int = conf_int_raw.reset_index()
+                            ci_time_col_name = conf_int.columns[0]
+                            if ci_time_col_name != 'time': 
+                                conf_int = conf_int.rename(columns={ci_time_col_name: 'time'})
+
+                            # Add zero point to confidence intervals if not present
+                            if 0 not in conf_int['time'].values:
+                                zero_row = pd.DataFrame({'time': [0], 
+                                                        lower_ci_col_name: [0.0], 
+                                                        upper_ci_col_name: [0.0]})
+                                conf_int = pd.concat([zero_row, conf_int], 
+                                                    ignore_index=True).sort_values('time')
+
+                            # Determine line width for CI bounds based on style
+                            upper_line_width = 0
+                            upper_line_dash = None
+                            if ci_style in ["lines", "both"]:
+                                upper_line_width = 1
+                                upper_line_dash = "dot"
+
+                            # Add upper CI bound
+                            fig.add_trace(go.Scatter(
+                                x=conf_int['time'], 
+                                y=conf_int[upper_ci_col_name], 
+                                mode='lines',
+                                line=dict(
+                                    width=upper_line_width, 
+                                    color=color, 
+                                    dash=upper_line_dash,
+                                    shape='hv'  # Use step shape to match the main curve
+                                ),
+                                hovertemplate=(f"<b>{label}</b><br>" +
+                                            "Time: %{x}<br>" +
+                                            "Upper 95% CI: %{y:.3f}<extra></extra>") 
+                                            if ci_style in ["lines", "both"] else None,
+                                hoverinfo='text' if ci_style in ["lines", "both"] else 'skip',
+                                showlegend=False, 
+                                name=f'{label}_upper_ci'
+                            ))
+                            
+                            # Set fill color with adjusted opacity based on style
+                            fill_opacity = 0.35  # Increased from 0.2 for better visibility on dark background
+                            if ci_style == "lines":
+                                fill_opacity = 0  # No fill for lines-only style
+                            
+                            # Add lower CI bound
+                            fig.add_trace(go.Scatter(
+                                x=conf_int['time'], 
+                                y=conf_int[lower_ci_col_name], 
+                                mode='lines',
+                                line=dict(
+                                    width=upper_line_width, 
+                                    color=color, 
+                                    dash=upper_line_dash,
+                                    shape='hv'  # Use step shape to match the main curve
+                                ),
+                                fillcolor=hex_to_rgba(color, fill_opacity),
+                                fill='tonexty' if ci_style in ["shaded", "both"] else None,
+                                hovertemplate=(f"<b>{label}</b><br>" +
+                                            "Time: %{x}<br>" +
+                                            "Lower 95% CI: %{y:.3f}<extra></extra>") 
+                                            if ci_style in ["lines", "both"] else None,
+                                hoverinfo='text' if ci_style in ["lines", "both"] else 'skip',
+                                showlegend=False, 
+                                name=f'{label}_lower_ci'
+                            ))
+                            
+                            conf_int_plotted = True
+                        else:
+                            st.warning(f"Could not dynamically identify lower/upper CI columns in {ci_cols} for group '{label}'.")
+                    else:
+                        st.warning(f"Confidence interval calculation returned empty for group '{label}'.")
+
+                except Exception as ci_e:
+                    st.warning(f"Could not calculate or plot confidence interval for group '{label}': {ci_e}")
+
+                # If CI plotting failed for any reason, ensure the flag reflects it
+                if not conf_int_plotted:
+                    st.info(f"Confidence interval will not be shown for group '{label}'.")
+
+            # --- Add the main cumulative hazard curve (step plot) ---
+            fig.add_trace(go.Scatter(
+                x=hazard_curve['time'],
+                y=hazard_curve[estimate_col_name],
+                mode='lines',
+                line=dict(shape='hv', color=color, width=2),
+                name=label,
+                legendgroup=label,
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    "Time: %{x}<br>"
+                    "Cumulative Hazard: %{y:.3f}<extra></extra>"
+                )
+            ))
+
+        except Exception as e:
+            st.warning(f"Could not fit or plot cumulative hazard for group '{label}' using Plotly: {e}", icon="⚠️")
+            # st.exception(e) # Uncomment for full traceback if needed
+
+    # --- Customize Layout ---
+    fig.update_layout(
+        title='Cumulative Hazard (Risk of Death) by Housing Type and Density',
+        xaxis_title='Days Since Fertilization',
+        yaxis_title='Cumulative Hazard H(t)',
+        legend_title_text='Housing - Density',
+        hovermode='x unified',
+        height=700,
+        xaxis=dict(gridcolor='rgba(128,128,128,0.2)'),
+        yaxis=dict(gridcolor='rgba(128,128,128,0.2)', range=[0, None]),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+    )
+
+    if not fig.data:
+        fig.add_annotation(text="No hazard curves could be generated.", showarrow=False)
 
     return fig
 
@@ -1398,6 +1789,117 @@ def plot_rate_change_by_density_pl(
     )
     return fig
 
+@st.cache_data # Cache the result of this potentially slow reconstruction
+def reconstruct_individual_fish_data(df_processed: pl.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Reconstructs individual fish survival data from dish-level time series data.
+
+    Args:
+        df_processed: The main Polars DataFrame after loading and initial processing.
+
+    Returns:
+        A Pandas DataFrame where each row is an individual fish's outcome
+        (time of death or time of censoring), suitable for lifelines.
+        Returns None if required columns are missing.
+    """
+    print("Reconstructing individual fish data for Lifelines...")
+    required_cols = [
+        'dish_id', 'days_since_fertilization', 'cumulative_deaths',
+        'initial_count', 'remaining', 'genotype', 'housing', # Use 'housing' directly
+        'density_category' # Add other potential grouping columns if needed
+    ]
+    if not all(c in df_processed.columns for c in required_cols):
+        missing = [c for c in required_cols if c not in df_processed.columns]
+        st.warning(f"Missing required columns for individual fish reconstruction: {missing}. Cannot proceed.")
+        return None
+
+    # Ensure necessary columns have compatible types before converting to Pandas
+    try:
+        df_pd = df_processed.select(required_cols).with_columns([
+            pl.col('days_since_fertilization').cast(pl.Int64),
+            pl.col('cumulative_deaths').cast(pl.Float64).cast(pl.Int64), # Ensure integer deaths
+            pl.col('initial_count').cast(pl.Int64),
+            pl.col('remaining').cast(pl.Float64).cast(pl.Int64), # Ensure integer remaining
+            pl.col('dish_id'), # Keep original type, usually int or str
+            pl.col('genotype').cast(pl.Utf8),
+            pl.col('housing').cast(pl.Utf8), # Ensure housing is Utf8
+            pl.col('density_category').cast(pl.Utf8)
+        ]).to_pandas()
+    except Exception as e:
+        st.error(f"Error converting Polars columns for reconstruction: {e}")
+        return None
+
+
+    survival_data = []
+    # Group by dish_id to track individual dishes over time
+    for dish_id, dish_data in df_pd.groupby('dish_id'):
+        # Sort by days since fertilization
+        dish_data = dish_data.sort_values('days_since_fertilization')
+
+        if dish_data.empty: continue # Skip empty groups
+
+        # Get metadata from the first row (should be consistent within dish)
+        # Use .iloc[0] safely after checking it's not empty
+        genotype = dish_data['genotype'].iloc[0]
+        housing_type = dish_data['housing'].iloc[0] # Use 'housing' column
+        density_category = dish_data['density_category'].iloc[0]
+
+        # Get the initial count (use first non-null ideally, but first row is usually ok if sorted)
+        initial_count = dish_data['initial_count'].iloc[0]
+        if pd.isna(initial_count): continue # Skip if initial count is missing
+
+        # Track the previously observed cumulative deaths
+        prev_cum_deaths = 0
+        last_day_observed = dish_data['days_since_fertilization'].max()
+
+        # For each time point
+        for _, row in dish_data.iterrows():
+            days = row['days_since_fertilization']
+            cum_deaths = row['cumulative_deaths']
+            if pd.isna(cum_deaths): continue # Skip rows with missing cumulative deaths
+
+            # Calculate new deaths in this period (handle potential float issues)
+            new_deaths = max(0, int(round(cum_deaths - prev_cum_deaths))) # Ensure non-negative integer
+
+            # Record each death
+            if new_deaths > 0:
+                for _ in range(new_deaths):
+                    survival_data.append({
+                        'dish_id': dish_id,
+                        'genotype': genotype,
+                        'housing_type': housing_type, # Use 'housing' column name
+                        'density_category': density_category,
+                        'time': days,
+                        'event': 1  # 1 indicates death occurred
+                    })
+
+            # Record censored (survived) observations ONLY at the last time point for this dish
+            if days == last_day_observed:
+                remaining = row['remaining']
+                if not pd.isna(remaining) and remaining > 0:
+                     # Ensure remaining is integer
+                     remaining_int = int(round(remaining))
+                     for _ in range(remaining_int):
+                        survival_data.append({
+                            'dish_id': dish_id,
+                            'genotype': genotype,
+                            'housing_type': housing_type, # Use 'housing' column name
+                            'density_category': density_category,
+                            'time': days,
+                            'event': 0  # 0 indicates censoring (still alive)
+                        })
+
+            # Update previously observed cumulative deaths
+            prev_cum_deaths = cum_deaths
+
+    if not survival_data:
+        st.warning("No individual fish survival data could be reconstructed.")
+        return None
+
+    # Create a dataframe from the survival data
+    survival_df = pd.DataFrame(survival_data)
+    print(f"Individual fish data reconstructed with {len(survival_df)} entries.")
+    return survival_df
 
 # --- calculate_critical_period_stats ---
 @st.cache_data
@@ -1527,8 +2029,6 @@ def display_stats_table(stats_df: Optional[pl.DataFrame], title: str):
 
 
 # --- Streamlit App Logic ---
-
-# REMOVED: CSV_FILE_PATH = "src/metazebrobot_dashboard/survivability_report.csv"
 
 # Add a persistent state for caching control
 if 'data_loaded' not in st.session_state:
@@ -1704,38 +2204,33 @@ else:
 st.sidebar.title("Plot & Analysis Controls")
 
 if df_processed is not None and df_processed.height > 0:
-    # Define plot options including the new ones
+    # Define plot options including the new one
     plot_options = [
         "Survival by Genotype/Housing",
         "Survival by Density",
-        "Survival by Cross ID", # New
-        "Cumulative Deaths", # New
+        "Survival by Cross ID",
+        "Cumulative Deaths",
         "Density vs Survival",
         "Housing Comparison",
         "Remaining Fish by Housing/Density",
         "Daily Survival Rate Change (Geno/Housing)",
         "Rate Change by Density",
-        "Distribution Plots", # New
-        "Statistical Tests" # New
+        "Distribution Plots",
+        "Statistical Tests",
+        "Faceted Survival (Density/Housing)",
+        "Cumulative Hazard (Individual Fish)"
     ]
     plot_type = st.sidebar.radio("Select Analysis Type:", options=plot_options, key="plot_type_selector")
 
     # --- Prepare Filter Options ---
-    # Derive options AFTER data loading and standardization (using Utf8 columns)
     def get_unique_options(df, col_name):
         """Safely gets unique, sorted, non-null string options from a column."""
         if col_name in df.columns:
             try:
-                # Ensure Utf8, get unique, drop nulls, sort, convert to list
-                return df.select(
-                        pl.col(col_name).cast(pl.Utf8).drop_nulls()
-                    ).unique().sort(col_name)[col_name].to_list()
-            except Exception as e:
-                print(f"Could not get unique options for {col_name}: {e}")
-                return []
+                return df.select(pl.col(col_name).cast(pl.Utf8).drop_nulls()).unique().sort(col_name)[col_name].to_list()
+            except Exception as e: print(f"Could not get unique options for {col_name}: {e}"); return []
         return []
 
-    # Get options using the helper function
     all_geno_housing_options = get_unique_options(df_processed, 'genotype_housing')
     all_density_options = get_unique_options(df_processed, 'density_category')
     all_cross_id_options = get_unique_options(df_processed, 'cross_id')
@@ -1756,10 +2251,37 @@ if df_processed is not None and df_processed.height > 0:
     selected_dist_groups = None
     stat_test_type = None
     anova_metric = None
+    selected_visible_housings_indiv = None
+    selected_visible_densities_indiv = None
+    show_ci_indiv = False # Default to False
 
     st.sidebar.markdown("---") # Separator
 
     # --- Configure controls based on selected plot_type ---
+    if plot_type == "Faceted Survival (Density/Housing)":
+        st.sidebar.markdown("### Faceted Plot Options")
+        facet_options = {'Density Category': 'density_category', 'Housing Type': 'housing'}
+        facet_label = st.sidebar.selectbox("Facet By (Subplots):", options=list(facet_options.keys()), key="facet_select")
+        facet_column = facet_options[facet_label]
+
+        # Determine the coloring column based on the facet choice
+        if facet_column == 'density_category':
+            color_column = 'housing'
+            color_label = 'Housing Type'
+        else:
+            color_column = 'density_category'
+            color_label = 'Density Category'
+        st.sidebar.write(f"Coloring By: {color_label}") # Display the automatic choice
+
+        # Add multiselect filters for both density and housing
+        if all_density_options:
+             selected_visible_densities = st.sidebar.multiselect("Select Density Categories:", options=all_density_options, default=all_density_options, key="facet_density_multi")
+        else: st.sidebar.warning("Column 'density_category' not found or has no options.")
+
+        if all_housing_options:
+             selected_visible_housings = st.sidebar.multiselect("Select Housing Types:", options=all_housing_options, default=all_housing_options, key="facet_housing_multi")
+        else: st.sidebar.warning("Column 'housing' not found or has no options.")
+
     if plot_type == "Survival by Genotype/Housing":
         if all_geno_housing_options: selected_geno_housing_groups = st.sidebar.multiselect("Select Genotype/Housing Groups:", options=all_geno_housing_options, default=all_geno_housing_options, key="survival_geno_house_multi")
         else: st.sidebar.warning("Column 'genotype_housing' not found or has no options.")
@@ -1845,7 +2367,6 @@ if df_processed is not None and df_processed.height > 0:
               else: st.sidebar.warning("No suitable grouping columns with options found.")
          else: st.sidebar.warning("No suitable metrics found or calculable for distribution plots.")
 
-
     elif plot_type == "Statistical Tests":
          test_options = []
          # Check if necessary columns for each test exist
@@ -1873,12 +2394,57 @@ if df_processed is not None and df_processed.height > 0:
              if SCIPY_AVAILABLE:
                   st.sidebar.warning("Insufficient columns found in the data to perform available statistical tests.")
 
+    elif plot_type == "Cumulative Hazard (Individual Fish)":
+        if not LIFELINES_AVAILABLE:
+            st.sidebar.warning("`lifelines` package not installed. This feature is unavailable.", icon="⚠️")
+        else:
+            st.sidebar.markdown("### Individual Hazard Plot Options")
+            # Filters for density and housing
+            if all_density_options:
+                selected_visible_densities_indiv = st.sidebar.multiselect(
+                    "Select Density Categories:", 
+                    options=all_density_options, 
+                    default=all_density_options, 
+                    key="indiv_haz_density_multi"
+                )
+            else:
+                st.sidebar.warning("Column 'density_category' not found or has no options.")
+
+            if all_housing_options:
+                selected_visible_housings_indiv = st.sidebar.multiselect(
+                    "Select Housing Types:", 
+                    options=all_housing_options, 
+                    default=all_housing_options, 
+                    key="indiv_haz_housing_multi"
+                )
+            else:
+                st.sidebar.warning("Column 'housing' not found or has no options.")
+
+            # Checkbox for confidence intervals
+            show_ci_indiv = st.sidebar.checkbox(
+                "Show 95% Confidence Intervals", 
+                value=True,  # Set to True by default
+                key="indiv_haz_ci"
+            )
+            
+            # Add CI style selector (only show when CIs are enabled)
+            if show_ci_indiv:
+                ci_style = st.sidebar.selectbox(
+                    "Confidence Interval Style:", 
+                    ["shaded", "lines", "both"], 
+                    index=0,  # Default to "shaded"
+                    key="indiv_haz_ci_style"
+                )
+            else:
+                ci_style = "shaded"  # Default value, won't be used when CIs are hidden
+
 
     # --- Main Panel: Display Plot / Stats ---
     st.subheader(f"Displaying: {plot_type}")
     fig = None
     stats_data = None
     test_results_df = None
+    matplotlib_fig = None
 
     try:
         # Determine visible groups based on plot type for median survival calc
@@ -1900,6 +2466,17 @@ if df_processed is not None and df_processed.height > 0:
                  elif cumulative_deaths_group_col == 'cross_id': visible_groups = selected_cross_id_groups
                  fig = plot_cumulative_deaths_pl(df_processed, group_by=cumulative_deaths_group_col, visible_conditions_list=visible_groups)
              else: st.warning("Please select a grouping variable in the sidebar.")
+        elif plot_type == "Faceted Survival (Density/Housing)":
+              if facet_column and color_column:
+                   fig = plot_survival_faceted_by_density_housing(
+                       df_processed,
+                       facet_col=facet_column,
+                       color_col=color_column,
+                       visible_densities=selected_visible_densities,
+                       visible_housings=selected_visible_housings
+                   )
+              else:
+                  st.warning("Please select faceting options in the sidebar.")
         elif plot_type == "Housing Comparison":
             fig = plot_housing_comparison_pl(df_processed)
         elif plot_type == "Density vs Survival":
@@ -1925,10 +2502,33 @@ if df_processed is not None and df_processed.height > 0:
              elif stat_test_type:
                  st.info(f"Statistical test '{stat_test_type}' selected, but no display logic implemented yet.")
              else: st.info("Select a statistical test from the sidebar.")
+        elif plot_type == "Cumulative Hazard (Individual Fish)":
+            if LIFELINES_AVAILABLE:
+                # Reconstruct the individual fish data
+                individual_survival_df = reconstruct_individual_fish_data(df_processed)
+                
+                if individual_survival_df is not None and not individual_survival_df.empty:
+                    # Generate the Plotly figure with corrected parameter names
+                    fig = plot_cumulative_hazard_individuals(
+                        survival_df=individual_survival_df,
+                        visible_housings=selected_visible_housings_indiv,
+                        visible_densities=selected_visible_densities_indiv,
+                        show_ci=show_ci_indiv,  # Pass the checkbox value
+                        ci_style=ci_style  # Pass the selected style
+                    )
+                    
+                    if fig is None:
+                        st.warning("Plot generation failed.")
+                else:
+                    st.warning("Could not reconstruct individual fish data suitable for Lifelines analysis.")
+            else:
+                st.error("`lifelines` package is required for this plot but not installed.")
+                fig = None  # Ensure fig is None if lifelines not available
 
 
         # Display plot if generated
-        if fig: st.plotly_chart(fig, use_container_width=True)
+        if fig: # Plotly figure
+            st.plotly_chart(fig, use_container_width=True)
 
         # Calculate and Display Median Survival for relevant plots
         if median_survival_group_col and plot_type in ["Survival by Genotype/Housing", "Survival by Density", "Survival by Cross ID"]:
